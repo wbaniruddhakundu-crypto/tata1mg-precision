@@ -1,213 +1,525 @@
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import re, io, zipfile, os, tempfile
-from pathlib import Path
-import fitz
-from openpyxl import load_workbook
+import io
+import re
+import zipfile
 from copy import copy
+from collections import defaultdict, Counter
 
-st.set_page_config(page_title="Tata 1mg Precision Validation Tool", page_icon="🧪", layout="wide")
+import fitz  # PyMuPDF
+import openpyxl
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+
+# ============================================================
+# Tata 1mg Precision Validation Automation
+# INTRA: 20 observations / level
+# INTER: Run 1 = first 5 INTRA observations / level
+#        Run 2 onward = 5 observations / level from each INTER PDF
+# ============================================================
+
+st.set_page_config(
+    page_title="Tata 1mg Precision Validation Automation",
+    page_icon="🧪",
+    layout="wide",
+)
 
 st.title("🧪 Tata 1mg Precision Validation Automation")
-st.caption("INTRA / INTER precision population from Tata 1mg assay PDFs into your Excel template")
+st.caption("Version 2 — merged-cell-safe Excel generation")
+st.caption(
+    "Upload the master Excel template, INTRA PDF(s), and INTER PDF(s). "
+    "The app extracts Result values only and creates one precision workbook per analyte."
+)
 
-with st.sidebar:
-    st.header("Study Configuration")
-    level_mode = st.radio("QC Level Configuration", ["Auto Detect", "2 Levels", "3 Levels"])
-    st.info("INTRA: 20 results per level. INTER Run 1 uses the first 5 INTRA results; subsequent INTER PDFs supply 5 results per run.")
+# -----------------------------
+# Helpers
+# -----------------------------
+NUM = r"[<>]?\s*-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?"
+RECORD_RE = re.compile(
+    rf"\bPR\s+(INTRA|INTER)\s+([A-Za-z0-9_.-]+)\s+({NUM})\s*([^\s]+)",
+    re.IGNORECASE,
+)
 
-st.header("1. Upload files")
-template_file = st.file_uploader("Excel precision template (.xlsx)", type=["xlsx"])
-intra_files = st.file_uploader("INTRA PDF(s)", type=["pdf"], accept_multiple_files=True)
-inter_files = st.file_uploader("INTER PDF(s)", type=["pdf"], accept_multiple_files=True)
+def normalize_analyte(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9]+", "_", name.strip())
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name or "Analyte"
 
-def pdf_text(uploaded):
-    data = uploaded.getvalue()
-    doc = fitz.open(stream=data, filetype="pdf")
-    return "\n".join(page.get_text("text") for page in doc)
+def safe_sheet_name(name: str) -> str:
+    bad = r'[]:*?/\\'
+    for c in bad:
+        name = name.replace(c, "_")
+    return name[:31] or "Sheet1"
 
-def normalize_analyte(x):
-    x = x.strip()
-    return re.sub(r'[^A-Za-z0-9]+', '_', x).strip('_').upper()
+def level_from_sid(mode: str, sid: str):
+    """Map Tata-style SID to QC level.
 
-def parse_pdf(text):
-    # Tata 1mg report records: PR INTRA/INTER <sample> <result> <unit> <RLU>
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
-    records=[]
-    current_assay=None
-    for i,line in enumerate(lines):
-        m=re.search(r'Tests:\s*([^;]+)', line, re.I)
+    Observed patterns:
+      INTRA: L101/L201/L301 or L1.01/L2.01/L3.01 -> 1/2/3
+      INTER: 301/302/303 or R201/R202/R203 -> 1/2/3
+    """
+    s = sid.upper().strip()
+
+    if mode == "INTRA":
+        m = re.match(r"L([123])(?:[.]?01)?$", s)
         if m:
-            current_assay=normalize_analyte(m.group(1))
-        elif current_assay and re.search(r'\bPR\s+(INTRA|INTER)\b', line, re.I):
-            typ=re.search(r'\bPR\s+(INTRA|INTER)\b', line, re.I).group(1).upper()
-            # Result is normally immediately after sample ID; use numeric value before unit.
-            tail=line.split(typ,1)[-1].strip()
-            nums=re.findall(r'(?<![A-Za-z])[-+]?\d+(?:\.\d+)?', tail)
-            if not nums:
+            return int(m.group(1))
+        # Generic fallback: first digit after L
+        m = re.search(r"L([123])", s)
+        if m:
+            return int(m.group(1))
+    else:
+        # Common separate INTER PDF pattern: 301/302/303
+        if re.fullmatch(r"[34]0[1-3]", s):
+            return int(s[-1])
+        # Embedded report pattern: R201/R202/R203
+        m = re.fullmatch(r"R20([1-3])", s)
+        if m:
+            return int(m.group(1))
+        # Generic fallback for numeric 30x/40x
+        m = re.search(r"0([1-3])$", s)
+        if m:
+            return int(m.group(1))
+
+    return None
+
+def extract_pdf_records(uploaded_file, expected_mode=None):
+    """Return records:
+       [{analyte, mode, sid, level, result, unit, page}]
+    """
+    data = uploaded_file.getvalue()
+    doc = fitz.open(stream=data, filetype="pdf")
+    records = []
+
+    for page_no, page in enumerate(doc, start=1):
+        text = page.get_text("text")
+        if not text:
+            continue
+
+        # Assay/analyte is normally declared near the top:
+        assay_match = re.search(
+            r"Tests:\s*([^;]+)\s*;", text, flags=re.IGNORECASE
+        )
+        assay = assay_match.group(1).strip() if assay_match else None
+
+        # Fallback to a line after "Test Status..."
+        if not assay:
+            lines = [x.strip() for x in text.splitlines() if x.strip()]
+            for i, line in enumerate(lines):
+                if line.lower().startswith("test status") and i + 1 < len(lines):
+                    if lines[i + 1] not in {"Assay Report"}:
+                        assay = lines[i + 1]
+                        break
+
+        for m in RECORD_RE.finditer(text):
+            mode = m.group(1).upper()
+            sid = m.group(2)
+            raw_result = m.group(3).replace(" ", "")
+            unit = m.group(4)
+
+            if expected_mode and mode != expected_mode:
                 continue
-            # first number may be SID (e.g. 301); result generally appears after SID.
-            # Tata reports use: PR INTER 301 2.5 g/dL ...
-            if len(nums)>=2:
-                result=float(nums[1])
-                sid=nums[0]
-            else:
-                result=float(nums[0]); sid=""
-            level_match=re.search(r'\b(L\d+)(?:\.\d+)?\b', tail, re.I)
-            # For INTER reports, level is encoded by SID 301/302/303; for INTRA often L101/L201/L301 or L1.01...
-            if level_match:
-                level="L"+str(int(re.search(r'\d+', level_match.group(1)).group()))
-            elif sid:
-                d=re.search(r'(\d{3})$',sid)
-                level="L"+d.group(1)[0] if d else None
-            else:
-                level=None
-            records.append({"analyte":current_assay,"type":typ,"level":level,"result":result,"sid":sid})
-    return pd.DataFrame(records)
 
-def improve_levels(df):
-    if df.empty: return df
-    def fix(row):
-        if row["level"] in ["L1","L2","L3"]: return row["level"]
-        sid=str(row.get("sid",""))
-        m=re.search(r'(\d{3})',sid)
-        if m and m.group(1)[0] in "123": return "L"+m.group(1)[0]
-        return row["level"]
-    df["level"]=df.apply(fix,axis=1)
-    return df
+            # Exclude RLU/MAU: the first numeric value after SID is the Result.
+            try:
+                result = float(raw_result.replace("<", "").replace(">", ""))
+            except ValueError:
+                continue
 
-def find_target_cells(ws, level, section_hint):
-    # Search text labels to find rows containing the requested level and section.
-    hits=[]
-    for row in ws.iter_rows():
-        for c in row:
-            if isinstance(c.value,str):
-                s=c.value.upper().replace(" ","")
-                if level.replace(" ","") in s and section_hint in s:
-                    hits.append(c.coordinate)
-    return hits
+            level = level_from_sid(mode, sid)
+            if level is None:
+                continue
 
-def write_results(ws, values, start_row, col):
-    for idx,v in enumerate(values[:20]):
-        ws.cell(start_row+idx, col).value = v
+            records.append(
+                {
+                    "analyte": assay or "Unknown",
+                    "mode": mode,
+                    "sid": sid,
+                    "level": level,
+                    "result": result,
+                    "unit": unit,
+                    "page": page_no,
+                }
+            )
 
-def populate_workbook(template_bytes, analyte_data, analyte):
-    wb=load_workbook(io.BytesIO(template_bytes))
-    # Work primarily on first sheet; preserve existing template sheets/styles/formulas.
-    ws=wb[wb.sheetnames[0]]
+    doc.close()
+    return records
 
-    # Heuristic population: identify cells containing level labels, then populate numeric cells below/adjacent.
-    # For custom templates, a review table is also included.
-    # We create a dedicated machine-readable sheet without altering original layout.
-    if "AUTO_DATA" in wb.sheetnames:
-        del wb["AUTO_DATA"]
-    data_ws=wb.create_sheet("AUTO_DATA")
-    headers=["Analyte","Type","Level","Run","Replicate","Result"]
-    data_ws.append(headers)
+def merge_records(files, expected_mode):
+    all_records = []
+    for f in files:
+        recs = extract_pdf_records(f, expected_mode=expected_mode)
+        all_records.extend(recs)
+    return all_records
 
-    for level in ["L1","L2","L3"]:
-        intra=analyte_data[(analyte_data.type=="INTRA") & (analyte_data.level==level)]["result"].tolist()
-        inter=analyte_data[(analyte_data.type=="INTER") & (analyte_data.level==level)]["result"].tolist()
+def group_records(records):
+    out = defaultdict(lambda: defaultdict(list))
+    units = {}
+    for r in records:
+        analyte = r["analyte"]
+        level = r["level"]
+        out[analyte][level].append(r["result"])
+        units.setdefault(analyte, r["unit"])
+    return out, units
 
-        for r,v in enumerate(intra[:20],1):
-            data_ws.append([analyte,"INTRA",level,"Within Run",r,v])
+def copy_template_to_output(template_bytes):
+    return load_workbook(io.BytesIO(template_bytes))
 
-        # Run 1 = first 5 INTRA values
-        for r,v in enumerate(intra[:5],1):
-            data_ws.append([analyte,"INTER",level,"Run 1",r,v])
+def find_template_layout(ws):
+    """Default layout from the user's shared example:
+       Inter values B:D, Intra values G:I, rows 7:26.
+       Returns detected positions where possible.
+    """
+    layout = {
+        "inter_cols": [2, 3, 4],
+        "intra_cols": [7, 8, 9],
+        "start_row": 7,
+        "end_row": 26,
+        "n_row": 28,
+        "mean_row": 29,
+        "sd_row": 30,
+        "cv_row": 31,
+        "level_header_row": 6,
+        "replicate_col": 6,
+    }
 
-        # INTER PDFs are already combined here; if more than 5 values exist, group by 5.
-        for j in range(0,len(inter),5):
-            run=j//5+2
-            for r,v in enumerate(inter[j:j+5],1):
-                data_ws.append([analyte,"INTER",level,f"Run {run}",r,v])
+    # Detect rows by labels if the template changes slightly.
+    for row in range(1, min(ws.max_row, 80) + 1):
+        vals = [str(ws.cell(row, c).value or "").strip().lower() for c in range(1, min(ws.max_column, 12) + 1)]
+        if "replicate" in vals:
+            layout["level_header_row"] = row
+            # Replicate column
+            for c, v in enumerate(vals, start=1):
+                if v == "replicate":
+                    layout["replicate_col"] = c
 
-    # Attempt to populate common template layout by finding level labels and writing down a nearby result column.
-    # This is deliberately conservative; AUTO_DATA guarantees no loss of extracted data.
-    for row in ws.iter_rows():
-        for c in row:
-            if isinstance(c.value,str):
-                txt=c.value.upper().replace(" ","")
-                m=re.fullmatch(r'(?:LEVEL)?([123])',txt)
-                if m:
-                    level="L"+m.group(1)
-                    vals=analyte_data[(analyte_data.type=="INTRA")&(analyte_data.level==level)]["result"].tolist()[:20]
-                    if vals:
-                        # Find first empty cell immediately below in same column.
-                        rr=c.row+1
-                        for v in vals:
-                            while rr <= ws.max_row and ws.cell(rr,c.column).value not in (None,""):
-                                rr+=1
-                            if rr>ws.max_row: break
-                            ws.cell(rr,c.column).value=v
-                            rr+=1
+        for c, v in enumerate(vals, start=1):
+            if v == "mean":
+                layout["mean_row"] = row
+            elif v in {"s.d.", "sd", "s.d"}:
+                layout["sd_row"] = row
+            elif v == "cv%":
+                layout["cv_row"] = row
+            elif v == "n":
+                layout["n_row"] = row
 
-    out=io.BytesIO()
-    wb.save(out); out.seek(0)
-    return out.getvalue()
+    return layout
 
-if st.button("🔎 Analyze PDFs", type="primary", use_container_width=True):
+def set_formula(ws, cell, formula):
+    ws[cell] = formula
+
+
+def writable_cell(ws, row, col):
+    """Return a writable cell and give a clear error for merged data cells."""
+    from openpyxl.cell.cell import MergedCell
+    cell = ws.cell(row, col)
+    if isinstance(cell, MergedCell):
+        for rng in ws.merged_cells.ranges:
+            if cell.coordinate in rng:
+                min_col, min_row, max_col, max_row = rng.bounds
+                if row == min_row and col == min_col:
+                    return ws.cell(min_row, min_col)
+                raise ValueError(
+                    f"Template has a merged cell covering {cell.coordinate} ({rng}). "
+                    "The precision data area must contain individual cells for each replicate."
+                )
+    return cell
+
+def write_value(ws, row, col, value):
+    writable_cell(ws, row, col).value = value
+
+def populate_workbook(template_bytes, analyte, unit, levels, intra_by_level, inter_runs_by_level):
+    wb = copy_template_to_output(template_bytes)
+    ws = wb.active
+    layout = find_template_layout(ws)
+
+    # Update title/analyte if possible without disturbing the template.
+    # The shared example places study title in A3.
+    if ws["A3"].value:
+        write_value(ws, 3, 1, f"Precision Studies of - {analyte}")
+
+    # Unit
+    unit_cell = ws.cell(7, 5)
+    if unit:
+        write_value(ws, unit_cell.row, unit_cell.column, unit)
+
+    # Clear data areas before population.
+    for row in range(layout["start_row"], layout["end_row"] + 1):
+        for col in layout["inter_cols"] + layout["intra_cols"]:
+            write_value(ws, row, col, None)
+
+    # Replicate numbers
+    for i, row in enumerate(range(layout["start_row"], layout["end_row"] + 1), start=1):
+        write_value(ws, row, layout["replicate_col"], i)
+
+    # INTRA: exactly first 20 observations per level.
+    for level in (1, 2, 3):
+        col = layout["intra_cols"][level - 1]
+        vals = list(intra_by_level.get(level, []))[:20]
+        for i, value in enumerate(vals):
+            write_value(ws, layout["start_row"] + i, col, value)
+
+    # INTER:
+    # Run 1 = first five INTRA observations.
+    # Run 2+ = first five values from each supplied INTER PDF/run.
+    # Flatten run-wise into the 20 rows of the shared template.
+    for level in (1, 2, 3):
+        col = layout["inter_cols"][level - 1]
+        inter_values = []
+
+        # Run 1
+        intra_vals = list(intra_by_level.get(level, []))
+        inter_values.extend(intra_vals[:5])
+
+        # Run 2 onwards
+        for run_values in inter_runs_by_level.get(level, []):
+            inter_values.extend(list(run_values)[:5])
+
+        for i, value in enumerate(inter_values[:20]):
+            write_value(ws, layout["start_row"] + i, col, value)
+
+        # If there are >20 inter observations, keep the template's 20-row design.
+        # The app reports overflow in the validation summary.
+
+    # Ensure N/Mean/SD/CV formulas match populated rows.
+    s = layout["start_row"]
+    e = layout["end_row"]
+
+    for idx, col in enumerate(layout["inter_cols"]):
+        letter = get_column_letter(col)
+        write_value(ws, layout["n_row"], col, f'=COUNT({letter}{s}:{letter}{e})')
+        write_value(ws, layout["mean_row"], col, f'=IFERROR(AVERAGE({letter}{s}:{letter}{e}),"")')
+        write_value(ws, layout["sd_row"], col, f'=IFERROR(STDEV({letter}{s}:{letter}{e}),"")')
+        write_value(ws, layout["cv_row"], col, f'=IFERROR(({letter}{layout["sd_row"]}/{letter}{layout["mean_row"]})*100,"")')
+
+    for idx, col in enumerate(layout["intra_cols"]):
+        letter = get_column_letter(col)
+        write_value(ws, layout["n_row"], col, f'=COUNT({letter}{s}:{letter}{e})')
+        write_value(ws, layout["mean_row"], col, f'=IFERROR(AVERAGE({letter}{s}:{letter}{e}),"")')
+        write_value(ws, layout["sd_row"], col, f'=IFERROR(STDEV({letter}{s}:{letter}{e}),"")')
+        write_value(ws, layout["cv_row"], col, f'=IFERROR(({letter}{layout["sd_row"]}/{letter}{layout["mean_row"]})*100,"")')
+
+    # 2-level mode: clear Level 3 and its statistics.
+    if levels == 2:
+        for col in (layout["inter_cols"][2], layout["intra_cols"][2]):
+            for row in range(layout["start_row"], layout["cv_row"] + 1):
+                write_value(ws, row, col, None)
+
+    # Ask Excel to recalculate formulas when opened.
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
+
+    # Filename-safe
+    return wb
+
+def workbook_bytes(wb):
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+# -----------------------------
+# UI
+# -----------------------------
+st.sidebar.header("Validation settings")
+
+level_mode = st.sidebar.selectbox(
+    "QC level configuration",
+    ["Auto Detect", "2 Levels", "3 Levels"],
+)
+
+use_first_five_for_inter1 = st.sidebar.checkbox(
+    "Use first 5 INTRA results as INTER Run 1",
+    value=True,
+)
+
+st.sidebar.info(
+    "Recommended: keep this enabled for your Tata 1mg workflow. "
+    "Each additional INTER PDF is treated as the next run and contributes 5 replicates per level."
+)
+
+template = st.file_uploader(
+    "1. Upload master Excel precision template",
+    type=["xlsx", "xlsm"],
+    accept_multiple_files=False,
+)
+
+intra_files = st.file_uploader(
+    "2. Upload INTRA PDF(s) — 20 replicates per level",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
+
+inter_files = st.file_uploader(
+    "3. Upload INTER PDF(s) — one PDF/run, 5 replicates per level",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
+
+if st.button("🔍 Process Validation Data", type="primary", use_container_width=True):
+    if not template:
+        st.error("Please upload the Excel precision template.")
+        st.stop()
+
     if not intra_files:
         st.error("Please upload at least one INTRA PDF.")
-    elif not template_file:
-        st.error("Please upload the Excel template.")
+        st.stop()
+
+    with st.spinner("Reading PDFs and extracting validation data..."):
+        intra_records = merge_records(intra_files, "INTRA")
+        inter_records = merge_records(inter_files or [], "INTER")
+
+    if not intra_records:
+        st.error("No INTRA Result records were detected.")
+        st.stop()
+
+    intra_group, units = group_records(intra_records)
+
+    # Group each INTER PDF separately so each file becomes a new run.
+    inter_file_groups = []
+    for f in inter_files or []:
+        recs = extract_pdf_records(f, expected_mode="INTER")
+        g, u = group_records(recs)
+        inter_file_groups.append((f.name, g, u))
+
+    # If user chose a fixed level count, use it; otherwise infer from INTRA.
+    detected_levels = sorted(
+        {lvl for analyte in intra_group.values() for lvl in analyte.keys() if lvl in (1, 2, 3)}
+    )
+
+    if level_mode == "2 Levels":
+        n_levels = 2
+    elif level_mode == "3 Levels":
+        n_levels = 3
     else:
-        all_intra=pd.concat([improve_levels(parse_pdf(pdf_text(f))) for f in intra_files], ignore_index=True)
-        all_inter=pd.concat([improve_levels(parse_pdf(pdf_text(f))) for f in inter_files], ignore_index=True) if inter_files else pd.DataFrame(columns=all_intra.columns)
-        all_data=pd.concat([all_intra,all_inter],ignore_index=True)
+        n_levels = 3 if 3 in detected_levels else 2
 
-        if level_mode=="2 Levels":
-            allowed=["L1","L2"]
-        elif level_mode=="3 Levels":
-            allowed=["L1","L2","L3"]
-        else:
-            found=sorted(set(x for x in all_data.level.dropna() if x in ["L1","L2","L3"]))
-            allowed=found
+    st.subheader("Extraction summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Analytes detected", len(intra_group))
+    c2.metric("Levels", n_levels)
+    c3.metric("INTRA records", len(intra_records))
+    c4.metric("INTER PDFs", len(inter_file_groups))
 
-        st.session_state["all_data"]=all_data
-        st.session_state["allowed"]=allowed
-        st.session_state["template"]=template_file.getvalue()
+    # Validation table
+    summary_rows = []
+    for analyte in sorted(intra_group):
+        for level in range(1, n_levels + 1):
+            n_intra = len(intra_group[analyte].get(level, []))
+            inter_pdf_counts = []
+            for _, g, _ in inter_file_groups:
+                inter_pdf_counts.append(len(g.get(analyte, {}).get(level, [])))
 
-if "all_data" in st.session_state:
-    df=st.session_state["all_data"]
-    allowed=st.session_state["allowed"]
-    analytes=sorted(df.analyte.dropna().unique())
+            summary_rows.append(
+                {
+                    "Analyte": analyte,
+                    "Level": f"L{level}",
+                    "INTRA": n_intra,
+                    "INTER PDF counts": ", ".join(map(str, inter_pdf_counts)) if inter_pdf_counts else "-",
+                    "Status": "OK" if n_intra >= 20 else f"CHECK: {n_intra}/20 INTRA",
+                }
+            )
 
-    st.success(f"Detected {len(analytes)} analyte(s) and {len(allowed)} QC level(s): {', '.join(allowed)}")
+    st.dataframe(summary_rows, use_container_width=True)
 
-    summary=[]
-    for a in analytes:
-        for l in allowed:
-            i=len(df[(df.analyte==a)&(df.type=="INTRA")&(df.level==l)])
-            e=len(df[(df.analyte==a)&(df.type=="INTER")&(df.level==l)])
-            summary.append({"Analyte":a,"Level":l,"INTRA":i,"INTER PDF values":e,"INTRA status":"OK" if i>=20 else f"Need {20-i}","INTER status":"OK" if e>=5 or e==0 else "Review"})
-    st.subheader("2. Review extracted data")
-    st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+    # Manual review / mapping area
+    with st.expander("🔎 Review detected analyte/level mapping before Excel creation", expanded=True):
+        st.write(
+            "The application maps Tata-style SIDs automatically: INTRA L101/L201/L301 → "
+            "Levels 1/2/3 and INTER 301/302/303 (or R201/R202/R203) → Levels 1/2/3."
+        )
+        st.write(
+            "Only the numeric Result is populated. RLU/MAU, flags and instrument evaluation text are ignored."
+        )
 
-    st.subheader("3. Generate precision workbooks")
-    if st.button("🚀 Generate All Analyte Excel Files", type="primary", use_container_width=True):
-        template=st.session_state["template"]
-        zip_buf=io.BytesIO()
-        generated=[]
-        with zipfile.ZipFile(zip_buf,"w",zipfile.ZIP_DEFLATED) as z:
-            for a in analytes:
-                ad=df[df.analyte==a].copy()
-                data=ad[ad.level.isin(allowed)]
-                xlsx=populate_workbook(template,data,a)
-                fname=f"{a}_Precision.xlsx"
-                z.writestr(fname,xlsx)
-                generated.append(fname)
-        zip_buf.seek(0)
-        st.session_state["zip"]=zip_buf.getvalue()
-        st.session_state["generated"]=generated
-        st.success(f"Generated {len(generated)} analyte workbook(s).")
+    # Generate outputs
+    outputs = {}
+    warnings = []
 
-if "zip" in st.session_state:
-    st.download_button("⬇️ DOWNLOAD ALL ANALYTES (ZIP)", st.session_state["zip"],
-                       file_name="Tata1MG_Precision_Validation_Output.zip",
-                       mime="application/zip", use_container_width=True)
-    st.subheader("Generated files")
-    for f in st.session_state["generated"]:
-        st.write("✓", f)
+    for analyte in sorted(intra_group):
+        intra_by_level = {
+            level: list(intra_group[analyte].get(level, []))
+            for level in range(1, n_levels + 1)
+        }
+
+        inter_runs_by_level = defaultdict(list)
+
+        # Run 1 = first 5 INTRA
+        if use_first_five_for_inter1:
+            for level in range(1, n_levels + 1):
+                inter_runs_by_level[level].append(intra_by_level.get(level, [])[:5])
+
+        # Run 2+ = each INTER PDF
+        for filename, g, _ in inter_file_groups:
+            for level in range(1, n_levels + 1):
+                vals = list(g.get(analyte, {}).get(level, []))
+                if vals:
+                    inter_runs_by_level[level].append(vals[:5])
+
+        # Checks
+        for level in range(1, n_levels + 1):
+            n = len(intra_by_level.get(level, []))
+            if n < 20:
+                warnings.append(f"{analyte} L{level}: only {n}/20 INTRA results found.")
+            for run_no, vals in enumerate(inter_runs_by_level[level], start=1):
+                if len(vals) < 5:
+                    warnings.append(
+                        f"{analyte} L{level}: INTER Run {run_no} has only {len(vals)}/5 values."
+                    )
+
+        # Pre-generation validation
+        for level in range(1, n_levels + 1):
+            if len(intra_by_level.get(level, [])) < 20:
+                st.error(f"{analyte} L{level}: only {len(intra_by_level.get(level, []))}/20 INTRA Result values were detected.")
+                st.stop()
+            if use_first_five_for_inter1 and len(intra_by_level.get(level, [])) < 5:
+                st.error(f"{analyte} L{level}: fewer than 5 INTRA values are available for INTER Run 1.")
+                st.stop()
+
+        wb = populate_workbook(
+            template.getvalue(),
+            analyte,
+            units.get(analyte, ""),
+            n_levels,
+            intra_by_level,
+            inter_runs_by_level,
+        )
+
+        outputs[f"{normalize_analyte(analyte)}_Precision.xlsx"] = workbook_bytes(wb)
+
+    # ZIP
+    zip_bio = io.BytesIO()
+    with zipfile.ZipFile(zip_bio, "w", zipfile.ZIP_DEFLATED) as z:
+        for filename, data in outputs.items():
+            z.writestr(filename, data)
+    zip_bio.seek(0)
+
+    st.success(f"Created {len(outputs)} analyte workbooks.")
+
+    if warnings:
+        st.warning("Review these items before using the validation output:")
+        for w in warnings:
+            st.write(f"• {w}")
+
+    st.download_button(
+        "⬇️ DOWNLOAD ALL ANALYTES — ZIP",
+        data=zip_bio.getvalue(),
+        file_name="Tata1MG_Precision_Validation_Output.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+    st.subheader("Individual analyte downloads")
+    cols = st.columns(3)
+    for i, (filename, data) in enumerate(outputs.items()):
+        with cols[i % 3]:
+            st.download_button(
+                f"Download {filename}",
+                data=data,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_{i}",
+            )
